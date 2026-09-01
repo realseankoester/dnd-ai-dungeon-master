@@ -1,8 +1,11 @@
 ﻿using System.ComponentModel;
+using System.Net.Mime;
 using DnDAIEngine.App;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.AI;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
+using OllamaSharp;
 
 Console.WriteLine("--- Initializing D&D AI Engine Prototype");
 
@@ -16,6 +19,8 @@ await db.Database.EnsureCreatedAsync();
 var session = new CampaignSession
 {
     Title = "The Goblin Ambush",
+    CurrentState = SessionState.InCombat,
+    CurrentTurnIndex = 0,
     Characters = new List<Character>
     {
         new Character
@@ -26,14 +31,31 @@ var session = new CampaignSession
             MaxHp = 12,
             Stats = new CharacterStats { Strength = 16, Dexterity = 12, Constitution = 14 }
         }
+    },
+    // Set up Turn Order / Initiative Tracker
+    Combatants = new List<Combatant>
+    {
+        new Combatant { Name = "Thorin", Initiative = 18, IsPlayer = true, CharacterId = 1 },
+        new Combatant { Name = "Sneaky Goblin", Initiative = 12, IsPlayer = false }
     }
 };
 db.CampaignSessions.Add(session);
 await db.SaveChangesAsync();
-Console.WriteLine("[DB Seed] Created fresh campaign with character 'Thorin' (HP: 12/12).");
 
-var activeSession = await db.CampaignSessions.Include(s => s.Characters).FirstAsync();
+var activeSession = await db.CampaignSessions
+.Include(s => s.Characters)
+.Include(s => s.Combatants)
+.Include(s => s.ChatHistoryMessages)
+.FirstAsync();
+
 var hero = activeSession.Characters.First();
+var activeCombatant = activeSession.Combatants.OrderByDescending(c => c.Initiative).ElementAt(activeSession.CurrentTurnIndex);
+
+Console.WriteLine("[DB Seed] Session Initialized. Combat Turn Order:");
+foreach (var c in activeSession.Combatants.OrderByDescending(x => x.Initiative))
+{
+    Console.WriteLine($" - {c.Name} (Initiative: {c.Initiative})");
+}
 
 // 2. Set Up Semantic Kernel + Ollama
 var kernelBuilder = Kernel.CreateBuilder();
@@ -42,31 +64,43 @@ kernelBuilder.AddOllamaChatCompletion("llama3.2", new Uri("http://localhost:1143
 // Add C# Plugins
 var healthPlugin = new HealthManagementPlugin(db);
 var dicePlugin = new DicePlugin();
+var turnPlugin = new TurnOrderPlugin(db, activeSession.Id);
 
 kernelBuilder.Plugins.AddFromObject(healthPlugin, "HealthPlugin");
 kernelBuilder.Plugins.AddFromObject(dicePlugin, "DicePlugin");
+kernelBuilder.Plugins.AddFromObject(turnPlugin, "TurnPlugin");
 
 var kernel = kernelBuilder.Build();
 var chatService = kernel.GetRequiredService<IChatCompletionService>();
 
 // 3. Build Chat Context
 var chatHistory = new ChatHistory();
-chatHistory.AddSystemMessage($"""
+string systemPrompt = $"""
     You are a D&D 5e Dungeon Master.
     
-    ACTIVE CHARACTER: {hero.Name} (ID: {hero.Id}, Class: {hero.Class}, HP: {hero.CurrentHp}/{hero.MaxHp}, AC: 15).
+    CURRENT COMBAT TURN: {activeCombatant.Name} (Is Player: {activeCombatant.IsPlayer}).
+    ACTIVE HERO: {hero.Name} (ID: {hero.Id}, Class: {hero.Class}, HP: {hero.CurrentHp}/{hero.MaxHp}, AC: 15).
     
-    RULES FOR ACTIONS:
-    1. If an attack or check occurs, call 'DicePlugin-roll_d20' first to determine success against target AC/DC.
-    2. If damage is rolled, call 'DicePlugin-roll_damage' (e.g., formula '1d6+2').
-    3. If damage or healing occurs, call 'HealthPlugin-modify_character_hp' (characterId: {hero.Id}, hpChange: negative integer for damage).
-    """);
+    RULES FOR COMBAT:
+    1. If an attack/check occurs, call 'DicePlugin-roll_d20' first.
+    2. If damage is rolled, call 'DicePlugin-roll_damage'.
+    3. If damage/healing occurs, call 'HealthPlugin-modify_character_hp'.
+    4. At the end of a combat turn, call 'TurnPlugin-advance_turn' to move to the next actor in initiative.
+    """;
+
+chatHistory.AddSystemMessage(systemPrompt);
+
+// Save System Message to DB
+db.ChatMessageEntities.Add(new ChatMessageEntity { CampaignSessionId = activeSession.Id, Role = "system", Content = systemPrompt });
+await db.SaveChangesAsync();
 
 // 4. Test Multi-Step Interaction
-string testInput = "A sneaky goblin shoots Thorin (AC 15) with a shortbow (+4 to hit, 1d6+2 damage)! Roll attack, damage if hit, and apply damage.";
-Console.WriteLine($"\n[Player Event]: {testInput}");
-chatHistory.AddUserMessage(testInput);
+string testInput = "Thorin swings his longsword (+5 to hit, 1d8+3 damage) at the Sneaky Goblin (AC 13)!";
+Console.WriteLine($"\n[Turn Action - {activeCombatant.Name}]: {testInput}");
 
+chatHistory.AddUserMessage(testInput);
+db.ChatMessageEntities.Add(new ChatMessageEntity { CampaignSessionId = activeSession.Id, Role = "user", Content = testInput});
+await db.SaveChangesAsync();
 Console.WriteLine("[Processing via Ollama / Llama 3.2...]");
 
 PromptExecutionSettings settings = new()
@@ -76,19 +110,54 @@ PromptExecutionSettings settings = new()
 
 var response = await chatService.GetChatMessageContentAsync(chatHistory, settings, kernel);
 
-// 5. Verify State Mutation
-await db.Entry(hero).ReloadAsync();
+// Save Assistant Narrative to DB
+db.ChatMessageEntities.Add(new ChatMessageEntity { CampaignSessionId = activeSession.Id, Role = "assistant", Content = response.Content ?? "" });
+await db.SaveChangesAsync();
+
+// 5. Verification Output
+await db.Entry(activeSession).ReloadAsync();
 
 Console.ForegroundColor = ConsoleColor.Cyan;
 Console.WriteLine($"\n[DM Narrative]: {response.Content}");
 Console.ResetColor();
 
+var updatedTurnActor = activeSession.Combatants.OrderByDescending(c => c.Initiative).ElementAt(activeSession.CurrentTurnIndex);
+
 Console.ForegroundColor = ConsoleColor.Yellow;
-Console.WriteLine($"\n[PostgreSQL Verification]: {hero.Name}'s HP in DB is now {hero.CurrentHp}/{hero.MaxHp}");
-Console.ResetColor();
+Console.WriteLine($"\n[PostgreSQL Verification]: Saved {db.ChatMessageEntities.Count()} chat messages. Next active turn actor is: '{updatedTurnActor.Name}'.");Console.ResetColor();
 
 // --- Plugins ---
 
+public class TurnOrderPlugin
+{
+    private readonly DnDDbContext _db;
+    private readonly int _sessionId;
+
+    public TurnOrderPlugin(DnDDbContext db, int sessionId)
+    {
+        _db = db;
+        _sessionId = sessionId;
+    }
+
+    [KernelFunction("advanced_turn")]
+    [Description("Advances the combat initiative order to the next actor's turn")]
+    public async Task<string> AdvanceTurnAsync()
+    {
+        var session = await _db.CampaignSessions.Include(s => s.Combatants).FirstAsync(s => s.Id == _sessionId);
+        int totalCombatants = session.Combatants.Count;
+
+        session.CurrentTurnIndex = (session.CurrentTurnIndex + 1) % totalCombatants;
+        await _db.SaveChangesAsync();
+
+        var nextActor = session.Combatants.OrderByDescending(c => c.Initiative).ElementAt(session.CurrentTurnIndex);
+
+        Console.ForegroundColor = ConsoleColor.Blue;
+        Console.WriteLine($"\n >>> [TURN PLUGIN] Advanced combat turn to index {session.CurrentTurnIndex}: {nextActor.Name}");
+        Console.ResetColor();
+
+        return $"Turn ended. Next actor to take an action is '{nextActor.Name}'.";
+    }
+}
 public class HealthManagementPlugin
 {
     private readonly DnDDbContext _db;
