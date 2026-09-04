@@ -7,21 +7,25 @@ using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using OllamaSharp;
 
-Console.WriteLine("--- Initializing D&D AI Engine Prototype");
-
-// 1. Initialize Database & Seed Baseline Character
-using var db = new DnDDbContext();
-
-// Clean database state for fresh prototype runs
-await db.Database.EnsureDeletedAsync();
-await db.Database.EnsureCreatedAsync();
-
-var session = new CampaignSession
+internal class Program
 {
-    Title = "The Goblin Ambush",
-    CurrentState = SessionState.InCombat,
-    CurrentTurnIndex = 0,
-    Characters = new List<Character>
+    private static async Task Main(string[] args)
+    {
+        Console.WriteLine("--- Initializing D&D AI Engine Prototype");
+
+        // 1. Initialize Database & Seed Baseline Character
+        using var db = new DnDDbContext();
+
+        // Clean database state for fresh prototype runs
+        await db.Database.EnsureDeletedAsync();
+        await db.Database.EnsureCreatedAsync();
+
+        var session = new CampaignSession
+        {
+            Title = "The Goblin Ambush",
+            CurrentState = SessionState.InCombat,
+            CurrentTurnIndex = 0,
+            Characters = new List<Character>
     {
         new Character
         {
@@ -32,99 +36,150 @@ var session = new CampaignSession
             Stats = new CharacterStats { Strength = 16, Dexterity = 12, Constitution = 14 }
         }
     },
-    // Set up Turn Order / Initiative Tracker
-    Combatants = new List<Combatant>
+            // Set up Turn Order / Initiative Tracker
+            Combatants = new List<Combatant>
     {
         new Combatant { Name = "Thorin", Initiative = 18, IsPlayer = true, CharacterId = 1 },
         new Combatant { Name = "Sneaky Goblin", Initiative = 12, IsPlayer = false }
     }
-};
-db.CampaignSessions.Add(session);
-await db.SaveChangesAsync();
+        };
+        db.CampaignSessions.Add(session);
+        await db.SaveChangesAsync();
 
-var activeSession = await db.CampaignSessions
-.Include(s => s.Characters)
-.Include(s => s.Combatants)
-.Include(s => s.ChatHistoryMessages)
-.FirstAsync();
+        var activeSession = await db.CampaignSessions
+        .Include(s => s.Characters)
+        .Include(s => s.Combatants)
+        .Include(s => s.ChatHistoryMessages)
+        .FirstAsync();
 
-var hero = activeSession.Characters.First();
-var activeCombatant = activeSession.Combatants.OrderByDescending(c => c.Initiative).ElementAt(activeSession.CurrentTurnIndex);
+        var hero = activeSession.Characters.First();
+        var activeCombatant = activeSession.Combatants.OrderByDescending(c => c.Initiative).ElementAt(activeSession.CurrentTurnIndex);
 
-Console.WriteLine("[DB Seed] Session Initialized. Combat Turn Order:");
-foreach (var c in activeSession.Combatants.OrderByDescending(x => x.Initiative))
-{
-    Console.WriteLine($" - {c.Name} (Initiative: {c.Initiative})");
-}
+        Console.WriteLine("[DB Seed] Session Initialized. Combat Turn Order:");
+        foreach (var c in activeSession.Combatants.OrderByDescending(x => x.Initiative))
+        {
+            Console.WriteLine($" - {c.Name} (Initiative: {c.Initiative})");
+        }
 
-// 2. Set Up Semantic Kernel + Ollama
-var kernelBuilder = Kernel.CreateBuilder();
-kernelBuilder.AddOllamaChatCompletion("llama3.2", new Uri("http://localhost:11434"));
+        // 2. Set Up Semantic Kernel + Ollama
+        var kernelBuilder = Kernel.CreateBuilder();
+        kernelBuilder.AddOllamaChatCompletion("llama3.2", new Uri("http://localhost:11434"));
 
-// Add C# Plugins
-var healthPlugin = new HealthManagementPlugin(db);
-var dicePlugin = new DicePlugin();
-var turnPlugin = new TurnOrderPlugin(db, activeSession.Id);
+        // Add C# Plugins
+        var combatPlugin = new CombatEnginePlugin(db, activeSession.Id);
+        var turnPlugin = new TurnOrderPlugin(db, activeSession.Id);
 
-kernelBuilder.Plugins.AddFromObject(healthPlugin, "HealthPlugin");
-kernelBuilder.Plugins.AddFromObject(dicePlugin, "DicePlugin");
-kernelBuilder.Plugins.AddFromObject(turnPlugin, "TurnPlugin");
+        kernelBuilder.Plugins.AddFromObject(combatPlugin, "CombatPlugin");
+        kernelBuilder.Plugins.AddFromObject(turnPlugin, "TurnPlugin");
 
-var kernel = kernelBuilder.Build();
-var chatService = kernel.GetRequiredService<IChatCompletionService>();
+        var kernel = kernelBuilder.Build();
+        var chatService = kernel.GetRequiredService<IChatCompletionService>();
 
-// 3. Build Chat Context
-var chatHistory = new ChatHistory();
-string systemPrompt = $"""
-    You are a D&D 5e Dungeon Master.
+        // 3. Build Chat Context
+        var chatHistory = new ChatHistory();
+        string systemPrompt = $"""
+    You are a D&D 5e Dungeon Master assistant.
     
-    CURRENT COMBAT TURN: {activeCombatant.Name} (Is Player: {activeCombatant.IsPlayer}).
-    ACTIVE HERO: {hero.Name} (ID: {hero.Id}, Class: {hero.Class}, HP: {hero.CurrentHp}/{hero.MaxHp}, AC: 15).
-    
-    RULES FOR COMBAT:
-    1. If an attack/check occurs, call 'DicePlugin-roll_d20' first.
-    2. If damage is rolled, call 'DicePlugin-roll_damage'.
-    3. If damage/healing occurs, call 'HealthPlugin-modify_character_hp'.
-    4. At the end of a combat turn, call 'TurnPlugin-advance_turn' to move to the next actor in initiative.
+    INSTRUCTIONS:
+    - Whenever a character attacks, call 'CombatPlugin-execute_attack'.
+    - Required arguments: attackerName, targetName, attackModifier, targetAc, damageFormula.
+    - Example: execute_attack(attackerName="Thorin", targetName="Sneaky Goblin", attackModifier=5, targetAc=13, damageFormula="1d8+3")
     """;
 
-chatHistory.AddSystemMessage(systemPrompt);
+        chatHistory.AddSystemMessage(systemPrompt);
 
-// Save System Message to DB
-db.ChatMessageEntities.Add(new ChatMessageEntity { CampaignSessionId = activeSession.Id, Role = "system", Content = systemPrompt });
-await db.SaveChangesAsync();
+        // Save System Message to DB
+        db.ChatMessageEntities.Add(new ChatMessageEntity { CampaignSessionId = activeSession.Id, Role = "system", Content = systemPrompt });
+        await db.SaveChangesAsync();
 
-// 4. Test Multi-Step Interaction
-string testInput = "Thorin swings his longsword (+5 to hit, 1d8+3 damage) at the Sneaky Goblin (AC 13)!";
-Console.WriteLine($"\n[Turn Action - {activeCombatant.Name}]: {testInput}");
+        // 4. Test Multi-Step Interaction
+        string testInput = "Thorin swings his longsword (+5 to hit, 1d8+3 damage) at the Sneaky Goblin (AC 13)!";
+        Console.WriteLine($"\n[Turn Action - {activeCombatant.Name}]: {testInput}");
 
-chatHistory.AddUserMessage(testInput);
-db.ChatMessageEntities.Add(new ChatMessageEntity { CampaignSessionId = activeSession.Id, Role = "user", Content = testInput});
-await db.SaveChangesAsync();
-Console.WriteLine("[Processing via Ollama / Llama 3.2...]");
+        chatHistory.AddUserMessage(testInput);
+        db.ChatMessageEntities.Add(new ChatMessageEntity { CampaignSessionId = activeSession.Id, Role = "user", Content = testInput });
+        await db.SaveChangesAsync();
 
-PromptExecutionSettings settings = new()
-{
-    FunctionChoiceBehavior = FunctionChoiceBehavior.Auto()
-};
+        Console.WriteLine("[Processing via Ollama / Llama 3.2...]");
 
-var response = await chatService.GetChatMessageContentAsync(chatHistory, settings, kernel);
+        PromptExecutionSettings settings = new() { FunctionChoiceBehavior = FunctionChoiceBehavior.Auto() };
+        var response = await chatService.GetChatMessageContentAsync(chatHistory, settings, kernel);
 
-// Save Assistant Narrative to DB
-db.ChatMessageEntities.Add(new ChatMessageEntity { CampaignSessionId = activeSession.Id, Role = "assistant", Content = response.Content ?? "" });
-await db.SaveChangesAsync();
+        string rawContent = response.Content?.Trim() ?? string.Empty;
+        string finalNarrative = rawContent;
 
-// 5. Verification Output
-await db.Entry(activeSession).ReloadAsync();
+        // Check if Llama 3.2 emitted a JSON tool string directly
+        if (rawContent.Contains("execute_attack"))
+        {
+            try
+            {
+                // Extract raw JSON block if embedded in text
+                int jsonStart = rawContent.IndexOf('{');
+                int jsonEnd = rawContent.LastIndexOf('}');
 
-Console.ForegroundColor = ConsoleColor.Cyan;
-Console.WriteLine($"\n[DM Narrative]: {response.Content}");
-Console.ResetColor();
+                if (jsonStart >= 0 && jsonEnd > jsonStart)
+                {
+                    string jsonString = rawContent.Substring(jsonStart, jsonEnd - jsonStart + 1);
+                    using var doc = System.Text.Json.JsonDocument.Parse(jsonString);
+                    var root = doc.RootElement;
 
-var updatedTurnActor = activeSession.Combatants.OrderByDescending(c => c.Initiative).ElementAt(activeSession.CurrentTurnIndex);
+                    if (root.TryGetProperty("parameters", out var paramsObj))
+                    {
+                        string attacker = paramsObj.GetProperty("attackerName").GetString() ?? "Thorin";
+                        string target = paramsObj.GetProperty("targetName").GetString() ?? "Sneaky Goblin";
 
-Console.ForegroundColor = ConsoleColor.Yellow;
-Console.WriteLine($"\n[PostgreSQL Verification]: Saved {db.ChatMessageEntities.Count()} chat messages. Next active turn actor is: '{updatedTurnActor.Name}'.");Console.ResetColor();
+                        // Parse integers whether Llama returned them as strings ("13") or numbers (13)
+                        int attackMod = paramsObj.GetProperty("attackModifier").ValueKind == System.Text.Json.JsonValueKind.String
+                            ? int.Parse(paramsObj.GetProperty("attackModifier").GetString()!)
+                            : paramsObj.GetProperty("attackModifier").GetInt32();
+
+                        int ac = paramsObj.GetProperty("targetAc").ValueKind == System.Text.Json.JsonValueKind.String
+                            ? int.Parse(paramsObj.GetProperty("targetAc").GetString()!)
+                            : paramsObj.GetProperty("targetAc").GetInt32();
+
+                        string formula = paramsObj.GetProperty("damageFormula").GetString() ?? "1d8+3";
+
+                        // 1. Run C# Engine
+                        string combatResultText = await combatPlugin.ExecuteAttackAsync(attacker, target, attackMod, ac, formula);
+
+                        // 2. Feed exact C# result back to LLM for final narration
+                        chatHistory.AddUserMessage($"[SYSTEM RULE: Narrate the following combat result in 1-2 dramatic sentences without mentioning die math]: {combatResultText}");
+
+                        var finalResponse = await chatService.GetChatMessageContentAsync(chatHistory, settings, kernel);
+
+                        // Fallback to combatResultText directly if the LLM output is empty or whitespace
+                        finalNarrative = string.IsNullOrWhiteSpace(finalResponse.Content) 
+                            ? combatResultText 
+                            : finalResponse.Content.Trim();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"\n[Fallback Parser Exception]: {ex.Message}");
+                Console.ResetColor();
+            }
+        }
+
+        // Save Assistant Narrative to DB
+        db.ChatMessageEntities.Add(new ChatMessageEntity { CampaignSessionId = activeSession.Id, Role = "assistant", Content = finalNarrative });
+        await db.SaveChangesAsync();
+
+        // 5. Verification Output
+        await db.Entry(activeSession).ReloadAsync();
+
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"\n[DM Narrative]: {finalNarrative}");
+        Console.ResetColor();
+
+        var updatedTurnActor = activeSession.Combatants.OrderByDescending(c => c.Initiative).ElementAt(activeSession.CurrentTurnIndex);
+
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"\n[PostgreSQL Verification]: Saved {db.ChatMessageEntities.Count()} chat messages. Next active turn actor is: '{updatedTurnActor.Name}'.");
+        Console.ResetColor();
+    }
+}
 
 // --- Plugins ---
 
@@ -158,96 +213,100 @@ public class TurnOrderPlugin
         return $"Turn ended. Next actor to take an action is '{nextActor.Name}'.";
     }
 }
-public class HealthManagementPlugin
+public class CombatEnginePlugin
 {
     private readonly DnDDbContext _db;
-    public HealthManagementPlugin(DnDDbContext db) => _db = db;
-
-    [KernelFunction("modify_character_hp")]
-    [Description("Applies damage (negative value) or healing (positive value) to a character in the database.")]
-    public async Task<string> ModifyCharacterHpAsync(
-        [Description("The character's database ID")] int characterId,
-        [Description("The HP delta: negative for damage, positive for healing")] int hpChange)
-    {
-        var character = await _db.Characters.FindAsync(characterId);
-        if (character == null) return "Character not found.";
-
-        character.CurrentHp = Math.Clamp(character.CurrentHp + hpChange, 0, character.MaxHp);
-        await _db.SaveChangesAsync();
-
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine($"\n >>> [HEALTH PLUGIN EXECUTED] Modified character {characterId} HP by {hpChange}. New Total: {character.CurrentHp}");
-        Console.ResetColor();
-
-        return $"Updated {character.Name}'s HP to {character.CurrentHp}/{character.MaxHp}.";
-    }
-}
-
-public class DicePlugin
-{
+    private readonly int _sessionId;
     private readonly Random _random = new();
 
-    [KernelFunction("roll_d20")]
-    [Description("Rolls a 20-sided die (d20) with a modifier, target DC/AC, and optional advantage or disadvantage.")]
-    public string RollD20(
-        [Description("Stat or skill modifier to add to the roll")] int modifier,
-        [Description("Target Difficulty Class (DC) or Armor Class (AC) to beat")] int targetDc,
-        [Description("Roll type: 'normal', 'advantage', or 'disadvantage'")] string rollType = "normal")
+    public CombatEnginePlugin(DnDDbContext db, int sessionId)
     {
-        int roll1 = _random.Next(1, 21);
-        int roll2 = _random.Next(1, 21);
-
-        int baseRoll = rollType.ToLower() switch
-        {
-            "advantage" => Math.Max(roll1, roll2),
-            "disadvantage" => Math.Min(roll1, roll2),
-            _ => roll1
-        };
-
-        int total = baseRoll + modifier;
-        bool isSuccess = total >= targetDc;
-        string outcome = isSuccess ? "SUCCESS / HIT" : "FAILURE / MISS";
-
-        Console.ForegroundColor = ConsoleColor.Magenta;
-        Console.WriteLine($"\n >>> [DICE PLUGIN] Rolled d20 ({baseRoll}) + Mod ({modifier}) = {total} vs Target {targetDc} -> {outcome}");
-        Console.ResetColor();
-
-        return $"{outcome}! Base Roll: {baseRoll}, Total: {total} (vs DC/AC {targetDc}).";
+        _db = db;
+        _sessionId = sessionId;
     }
 
-    [KernelFunction("roll_damage")]
-    [Description("Rolls damage dice in standard notation like '1d6+2' or '2d8+3'.")]
-    public string RollDamage(
-        [Description("Dice formula in format 'NdX+M' or 'NdX' (e.g., '1d6+2', '2d8')")] string diceFormula)
+    [KernelFunction("execute_attack")]
+    [Description("Executes a full D&D 5e attack sequence against a target: rolls d20 vs AC, and ONLY if it hits, rolls damage and updates HP.")]
+    public async Task<string> ExecuteAttackAsync(
+        [Description("Attacker name")] string attackerName,
+        [Description("Target name (e.g. 'Sneaky Goblin' or 'Thorin')")] string targetName,
+        [Description("Attack modifier integer (e.g. 5)")] int attackModifier,
+        [Description("Target AC integer (e.g. 13)")] int targetAc,
+        [Description("Damage dice formula (e.g. '1d8+3')")] string damageFormula)
+    {
+        // 1. Roll Attack (d20 + modifier)
+        int d20Roll = _random.Next(1, 21);
+        int totalAttack = d20Roll + attackModifier;
+        bool isHit = totalAttack >= targetAc;
+
+        Console.ForegroundColor = ConsoleColor.Magenta;
+        Console.WriteLine($"\n >>> [COMBAT ENGINE] {attackerName} Attack Roll: {d20Roll} + {attackModifier} = {totalAttack} vs AC {targetAc}");
+
+        if (!isHit)
+        {
+            Console.WriteLine($" >>> [COMBAT ENGINE] Outcome: MISS! Skipping damage roll.");
+            Console.ResetColor();
+            return $"{attackerName}'s attack missed {targetName}! Rolled {totalAttack} vs AC {targetAc}.";
+        }
+
+        // 2. Roll Damage
+        int damageTotal = ParseAndRollDamage(damageFormula);
+        Console.WriteLine($" >>> [COMBAT ENGINE] Outcome: HIT! Rolled {damageFormula} = {damageTotal} damage.");
+
+        // 3. Mutate DB State
+        var session = await _db.CampaignSessions
+            .Include(s => s.Combatants)
+            .FirstOrDefaultAsync(s => s.Id == _sessionId);
+
+        var targetCombatant = session?.Combatants.FirstOrDefault(c => c.Name.Equals(targetName, StringComparison.OrdinalIgnoreCase));
+        
+        string hpStatusMessage = "";
+        if (targetCombatant != null)
+        {
+            // If linked to a PC character, update Character entity
+            if (targetCombatant.CharacterId != null)
+            {
+                var defenderChar = await _db.Characters.FindAsync(targetCombatant.CharacterId);
+                if (defenderChar != null)
+                {
+                    defenderChar.CurrentHp = Math.Clamp(defenderChar.CurrentHp - damageTotal, 0, defenderChar.MaxHp);
+                    hpStatusMessage = $"{defenderChar.Name} HP is now {defenderChar.CurrentHp}/{defenderChar.MaxHp}.";
+                }         
+            }
+            else
+            {
+                // Update direct Combatant HP for monsters
+                targetCombatant.CurrentHp = Math.Clamp(targetCombatant.CurrentHp - damageTotal, 0, targetCombatant.MaxHp);
+                hpStatusMessage = $"{targetCombatant.Name} HP is now {targetCombatant.CurrentHp}/{targetCombatant.MaxHp}.";
+            }
+
+            await _db.SaveChangesAsync();
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($" >>> [COMBAT ENGINE] Updated {targetName} HP in Postgres ({hpStatusMessage})");
+        }
+
+        Console.ResetColor();
+
+        return $"{attackerName}'s attack HIT {targetName} for {damageTotal} damage! {hpStatusMessage}";
+    }
+
+    private int ParseAndRollDamage(string formula)
     {
         try
         {
-            string[] parts = diceFormula.ToLower().Split('+');
+            string[] parts = formula.ToLower().Split('+');
             string[] diceParts = parts[0].Split('d');
-
             int count = int.Parse(diceParts[0]);
             int sides = int.Parse(diceParts[1]);
             int modifier = parts.Length > 1 ? int.Parse(parts[1]) : 0;
 
-            int total = 0;
-            List<int> rolls = new();
-            for (int i = 0; i < count; i++)
-            {
-                int r = _random.Next(1, sides + 1);
-                rolls.Add(r);
-                total += r;
-            }
-            total += modifier;
-
-            Console.ForegroundColor = ConsoleColor.Magenta;
-            Console.WriteLine($"\n >>> [DICE PLUGIN] Rolled {diceFormula}: [{string.Join(", ", rolls)}] + {modifier} = {total} damage");
-            Console.ResetColor();
-
-            return $"Damage Rolled ({diceFormula}): Total {total} damage.";
+            int total = modifier;
+            for (int i = 0; i < count; i++) total += _random.Next(1, sides + 1);
+            return total;
         }
         catch
         {
-            return "Invalid dice formula format. Use '1d6+2' or '2d8'.";
+            return 4; // Fallback default damage
         }
     }
 }

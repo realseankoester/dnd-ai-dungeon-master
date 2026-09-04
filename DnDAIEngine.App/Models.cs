@@ -58,6 +58,8 @@ public class Combatant
     public int Initiative { get; set; }
     public bool IsPlayer { get; set; }
     public int? CharacterId { get; set; }
+    public int CurrentHp { get; set; } = 7;
+    public int MaxHp { get; set; } = 7;
     public CampaignSession CampaignSession { get; set; } = null!;
 }
 
